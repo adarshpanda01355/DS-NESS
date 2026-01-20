@@ -49,8 +49,8 @@ HEARTBEAT_INTERVAL = float(os.environ.get("DS_HEARTBEAT_INTERVAL", "2.0"))
 # Time to wait before considering a node as failed
 # Should be > HEARTBEAT_INTERVAL to account for network delays
 # Typically 2-3x the heartbeat interval
-HEARTBEAT_TIMEOUT = float(os.environ.get("DS_HEARTBEAT_TIMEOUT", "6.0"))
-
+#HEARTBEAT_TIMEOUT = float(os.environ.get("DS_HEARTBEAT_TIMEOUT", "6.0"))
+HEARTBEAT_TIMEOUT = float(os.environ.get("DS_HEARTBEAT_TIMEOUT", "10.0")) #changed from 6.0 to 10.0 to avoid split brain issues (i.e two nodes electing themselves as coordinators)
 # Maximum time to wait for OK responses during leader election
 # If no OK received within this time, node declares itself coordinator
 ELECTION_TIMEOUT = float(os.environ.get("DS_ELECTION_TIMEOUT", "5.0"))
