@@ -148,11 +148,16 @@ class VectorClock:
         
         Args:
             node_id: ID of the departing node
+            
+        NOTE: We intentionally do NOT remove entries from the vector clock.
+        The Chat Application report (Section 2.5) recommends this approach:
+        "Messages in the hold-back queue that depend on a removed entry remain valid."
+        Removing entries can cause buffered messages to become undeliverable.
+        See ARCHITECTURAL_AUDIT.md Section 3 for details.
         """
-        with self._lock:
-            node_key = str(node_id)
-            if node_key in self._clock and node_key != self.node_id:
-                del self._clock[node_key]
+        # Intentionally empty - never remove vector clock entries
+        # This prevents race conditions with the hold-back queue
+        pass
     
     def can_deliver(self, sender_id, message_clock):
         """

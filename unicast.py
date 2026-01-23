@@ -48,13 +48,15 @@ class UnicastHandler:
     Includes simple acknowledgment tracking for reliable delivery.
     """
     
-    def __init__(self, node_id, port=None):
+    def __init__(self, node_id, port=None, host=None, peer_addresses=None):
         """
         Initialize unicast socket on the node's designated port.
         
         Args:
             node_id: Unique identifier for this node
             port: Optional explicit port (default: UNICAST_PORT_BASE + node_id)
+            host: Optional host IP to bind to (default: 127.0.0.1 for localhost)
+            peer_addresses: Optional dict mapping node_id -> IP address for multi-device
         """
         self.node_id = node_id
         
@@ -62,8 +64,13 @@ class UnicastHandler:
         # Each node gets a unique port: base + node_id
         self.port = port if port is not None else (UNICAST_PORT_BASE + node_id)
         
-        # Host address - localhost for single-machine testing
-        self.host = '127.0.0.1'
+        # Host address - localhost for single-machine, or specified IP for multi-device
+        self.host = host if host is not None else '127.0.0.1'
+        
+        # Peer addresses for multi-device deployment
+        # Maps node_id -> IP address
+        self._peer_addresses = peer_addresses if peer_addresses is not None else {}
+        self._peer_lock = threading.Lock()
         
         # Flag to control receive loop
         self._running = False
@@ -108,6 +115,9 @@ class UnicastHandler:
         """
         Get the address (host, port) for a target node.
         
+        For multi-device deployment, looks up the target's IP in peer_addresses.
+        Falls back to self.host (localhost) if not found.
+        
         Args:
             target_node_id: ID of the target node
             
@@ -115,7 +125,32 @@ class UnicastHandler:
             tuple: (host, port) for the target node
         """
         target_port = UNICAST_PORT_BASE + target_node_id
-        return (self.host, target_port)
+        # Use peer address if available, otherwise use our host (for localhost testing)
+        with self._peer_lock:
+            target_host = self._peer_addresses.get(target_node_id, self.host)
+        return (target_host, target_port)
+    
+    def register_peer(self, node_id, ip_address):
+        """
+        Register or update a peer's IP address for dynamic discovery.
+        
+        Called when we learn a node's IP from a multicast message.
+        This enables unicast communication with nodes that weren't
+        pre-configured via --peers.
+        
+        Args:
+            node_id: ID of the peer node
+            ip_address: IP address of the peer
+        """
+        with self._peer_lock:
+            if node_id not in self._peer_addresses:
+                self._peer_addresses[node_id] = ip_address
+                logger.info(f"Node {self.node_id}: Discovered peer Node {node_id} at {ip_address}")
+            elif self._peer_addresses[node_id] != ip_address:
+                # Update if IP changed (node restarted on different machine?)
+                old_ip = self._peer_addresses[node_id]
+                self._peer_addresses[node_id] = ip_address
+                logger.info(f"Node {self.node_id}: Updated peer Node {node_id}: {old_ip} -> {ip_address}")
     
     def send(self, message, target_node_id):
         """

@@ -180,6 +180,36 @@ class MulticastHandler:
             logger.error(f"Node {self.node_id}: Multicast send error: {e}")
             return False
     
+    def send_reliable(self, message, retries=3, delay=0.1):
+        """
+        Send a message multiple times for reliability.
+        
+        Used for critical messages like COORDINATOR announcements and JOIN
+        where packet loss could cause system inconsistency.
+        
+        NOTE: Do NOT use for heartbeats - they should remain as single sends
+        to avoid network congestion. See ARCHITECTURAL_AUDIT.md Section 4.
+        
+        Args:
+            message: Message to send
+            retries: Number of times to send (default: 3)
+            delay: Seconds between sends (default: 0.1)
+            
+        Returns:
+            bool: True if at least one send succeeded
+        """
+        import time
+        success = False
+        for i in range(retries):
+            if self.send(message):
+                success = True
+            if i < retries - 1:
+                time.sleep(delay)
+        
+        if success:
+            logger.debug(f"Node {self.node_id}: Reliable multicast sent ({retries} copies)")
+        return success
+    
     def receive(self):
         """
         Receive a single message from the multicast group (blocking).

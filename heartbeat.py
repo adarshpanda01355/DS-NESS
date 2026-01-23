@@ -249,13 +249,16 @@ class HeartbeatManager:
         
         while self._running:
             try:
-                # Increment vector clock for send event
-                clock = self.vector_clock.increment()
+                # NOTE: We intentionally do NOT increment vector clock for heartbeats.
+                # Heartbeats are liveness probes, not application events.
+                # Including them in causal ordering pollutes the clock and causes
+                # nodes that miss heartbeats to buffer all subsequent trade messages.
+                # See ARCHITECTURAL_AUDIT.md Section 3 for details.
                 
-                # Create heartbeat message
+                # Create heartbeat message (no vector clock)
                 heartbeat_msg = create_heartbeat(
                     sender_id=self.node_id,
-                    vector_clock=clock,
+                    vector_clock=None,  # Heartbeats don't participate in causal ordering
                     credits=self._energy_credits
                 )
                 
