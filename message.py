@@ -36,6 +36,8 @@ MSG_COORDINATOR = "COORDINATOR"
 # Node membership messages
 # JOIN: broadcast when a node joins the network
 MSG_JOIN = "JOIN"
+# JOIN_RESPONSE: coordinator sends state to joining node
+MSG_JOIN_RESPONSE = "JOIN_RESPONSE"
 # LEAVE: broadcast when a node gracefully leaves
 MSG_LEAVE = "LEAVE"
 
@@ -348,6 +350,31 @@ def create_join(sender_id, vector_clock):
         Message: Join announcement to broadcast
     """
     return Message(MSG_JOIN, sender_id, vector_clock=vector_clock)
+
+
+def create_join_response(sender_id, vector_clock, coordinator_id, known_nodes):
+    """
+    Create a join response message (sent by coordinator to joining node).
+    
+    Contains state information the new node needs to properly participate
+    in the distributed system, including vector clock state for causal ordering.
+    
+    Args:
+        sender_id: ID of the coordinator sending the response
+        vector_clock: Current vector clock state (new node will adopt this)
+        coordinator_id: ID of the current coordinator
+        known_nodes: List of all known node IDs in the system
+        
+    Returns:
+        Message: Join response message for unicast to new node
+    """
+    payload = {
+        "coordinator_id": coordinator_id,
+        "known_nodes": list(known_nodes),
+        "clock_state": vector_clock  # New node will initialize from this
+    }
+    return Message(MSG_JOIN_RESPONSE, sender_id, vector_clock=vector_clock,
+                   payload=payload)
 
 
 def create_leave(sender_id, vector_clock):

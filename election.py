@@ -258,10 +258,10 @@ class ElectionManager:
             vector_clock=clock
         )
         
-        # Broadcast to all nodes via multicast
-        self.multicast_handler.send(coordinator_msg)
+        # Broadcast to all nodes via multicast (reliable to ensure all nodes receive it)
+        self.multicast_handler.send_reliable(coordinator_msg)
         
-        logger.info(f"Node {self.node_id}: COORDINATOR message broadcast - "
+        logger.info(f"Node {self.node_id}: COORDINATOR message broadcast (reliable) - "
                    f"I am the new leader!")
         
         # Notify callback

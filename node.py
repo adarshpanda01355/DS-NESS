@@ -46,9 +46,9 @@ from multicast import MulticastHandler
 from unicast import UnicastHandler
 from message import (
     Message, MSG_HEARTBEAT, MSG_ELECTION, MSG_OK, MSG_COORDINATOR,
-    MSG_JOIN, MSG_LEAVE, MSG_TRADE_REQUEST, MSG_TRADE_RESPONSE,
+    MSG_JOIN, MSG_JOIN_RESPONSE, MSG_LEAVE, MSG_TRADE_REQUEST, MSG_TRADE_RESPONSE,
     MSG_TRADE_CONFIRM, MSG_LEDGER_SYNC,
-    create_join, create_leave, create_trade_request, create_trade_response,
+    create_join, create_join_response, create_leave, create_trade_request, create_trade_response,
     create_trade_confirm
 )
 from vector_clock import VectorClock
@@ -136,16 +136,22 @@ class Node:
     - Manages the node lifecycle
     """
     
-    def __init__(self, node_id, known_nodes=None):
+    def __init__(self, node_id, known_nodes=None, host=None, peer_addresses=None):
         """
         Initialize the node with all components.
         
         Args:
             node_id: Unique identifier for this node (also used as priority)
             known_nodes: Optional list of other node IDs in the system
+            host: Optional IP address to bind to (for multi-device deployment)
+            peer_addresses: Optional dict mapping node_id -> IP for multi-device
         """
         self.node_id = node_id
         self.priority = node_id  # Priority = node_id for Bully algorithm
+        
+        # Multi-device configuration
+        self._host = host
+        self._peer_addresses = peer_addresses or {}
         
         # Track known nodes in the system
         self._known_nodes = set(known_nodes) if known_nodes else set()
@@ -184,7 +190,11 @@ class Node:
             node_id=self.node_id
         )
         
-        self.unicast = UnicastHandler(node_id=self.node_id)
+        self.unicast = UnicastHandler(
+            node_id=self.node_id,
+            host=self._host,
+            peer_addresses=self._peer_addresses
+        )
         logger.debug(f"Node {self.node_id}: Communication handlers initialized")
         
         # 3. Energy ledger
@@ -298,11 +308,12 @@ class Node:
     def _announce_join(self):
         """
         Broadcast JOIN message to announce this node's presence.
+        Uses reliable multicast (3 sends) to ensure delivery.
         """
         clock = self.vector_clock.increment()
         join_msg = create_join(self.node_id, clock)
-        self.multicast.send(join_msg)
-        logger.info(f"Node {self.node_id}: JOIN announced")
+        self.multicast.send_reliable(join_msg)  # Critical: use reliable send
+        logger.info(f"Node {self.node_id}: JOIN announced (reliable)")
     
     def _announce_leave(self):
         """
@@ -326,7 +337,7 @@ class Node:
         
         Args:
             data: Raw bytes received
-            addr: Sender address (ip, port)
+            addr: Sender address (ip, port) - used for dynamic peer discovery
         """
         try:
             message = Message.from_bytes(data)
@@ -335,7 +346,18 @@ class Node:
             if message.sender_id == self.node_id:
                 return
             
+            # Dynamic peer discovery: learn sender's IP from multicast message
+            # This enables unicast communication without pre-configuring --peers
+            sender_ip = addr[0]
+            self.unicast.register_peer(message.sender_id, sender_ip)
+            
             logger.debug(f"Node {self.node_id}: Multicast received: {message}")
+            
+            # Heartbeats don't participate in causal ordering - handle immediately
+            # without updating vector clock. See ARCHITECTURAL_AUDIT.md Section 3.
+            if message.message_type == MSG_HEARTBEAT:
+                self._handle_heartbeat(message)
+                return
             
             # Check causal delivery for application messages
             if message.message_type in [MSG_TRADE_REQUEST, MSG_TRADE_CONFIRM, MSG_LEDGER_SYNC]:
@@ -344,7 +366,7 @@ class Node:
                     self._message_buffer.add(message, addr)
                     return
             
-            # Update vector clock
+            # Update vector clock for non-heartbeat messages
             self.vector_clock.update(message.vector_clock)
             
             # Route to handler
@@ -403,6 +425,8 @@ class Node:
         # Membership messages
         elif msg_type == MSG_JOIN:
             self._handle_join(message)
+        elif msg_type == MSG_JOIN_RESPONSE:
+            self._handle_join_response(message)
         elif msg_type == MSG_LEAVE:
             self._handle_leave(message)
         
@@ -463,6 +487,8 @@ class Node:
         Handle JOIN message - a new node has joined.
         
         Add the node to tracking systems and respond if we're coordinator.
+        If coordinator, send JOIN_RESPONSE with current vector clock state
+        so the new node can properly participate in causal ordering.
         """
         new_node_id = message.sender_id
         logger.info(f"Node {self.node_id}: Node {new_node_id} has joined")
@@ -476,12 +502,30 @@ class Node:
         self.heartbeat.add_node(new_node_id)
         self.election.add_node(new_node_id)
         
-        # If we're coordinator, announce ourselves
+        # If we're coordinator, send state to new node and announce ourselves
         if self.election.is_coordinator():
+            # Get current state to send to new node
             clock = self.vector_clock.increment()
+            current_clock_state = self.vector_clock.get_clock()
+            
+            with self._nodes_lock:
+                known_nodes_list = list(self._known_nodes)
+            
+            # Create and send JOIN_RESPONSE with state (reliable unicast)
+            join_response = create_join_response(
+                sender_id=self.node_id,
+                vector_clock=clock,
+                coordinator_id=self.node_id,
+                known_nodes=known_nodes_list
+            )
+            # Add clock_state to payload (already included in create_join_response)
+            self.unicast.send_with_retry(join_response, new_node_id, retries=5)
+            logger.info(f"Node {self.node_id}: Sent JOIN_RESPONSE to Node {new_node_id} with state")
+            
+            # Also announce ourselves as coordinator (reliable multicast)
             from message import create_coordinator
             coord_msg = create_coordinator(self.node_id, self.priority, clock)
-            self.multicast.send(coord_msg)
+            self.multicast.send_reliable(coord_msg)  # Critical: use reliable send
     
     def _handle_leave(self, message):
         """
@@ -505,6 +549,45 @@ class Node:
         if leaving_node_id == self.election.get_coordinator():
             logger.info(f"Node {self.node_id}: Coordinator left, starting election")
             self.election.start_election()
+    
+    def _handle_join_response(self, message):
+        """
+        Handle JOIN_RESPONSE message from coordinator.
+        
+        This message contains critical state for the new node:
+        - Vector clock state: Allows proper causal ordering of messages
+        - Coordinator ID: Know who the leader is
+        - Known nodes: List of all participants
+        
+        See ARCHITECTURAL_AUDIT.md Section 1 for why this is needed.
+        """
+        payload = message.payload
+        coordinator_id = payload.get("coordinator_id")
+        known_nodes = payload.get("known_nodes", [])
+        clock_state = payload.get("clock_state", {})
+        
+        logger.info(f"Node {self.node_id}: Received JOIN_RESPONSE from coordinator Node {coordinator_id}")
+        
+        # Update our vector clock from coordinator's state
+        # This ensures we can properly participate in causal ordering
+        if clock_state:
+            self.vector_clock.update(clock_state)
+            logger.info(f"Node {self.node_id}: Vector clock synchronized from coordinator")
+        
+        # Update coordinator reference
+        self.election.set_coordinator(coordinator_id)
+        
+        # Add all known nodes to our tracking
+        for node_id in known_nodes:
+            if node_id != self.node_id:
+                with self._nodes_lock:
+                    self._known_nodes.add(node_id)
+                self.vector_clock.add_node(node_id)
+                self.heartbeat.add_node(node_id)
+                self.election.add_node(node_id)
+        
+        logger.info(f"Node {self.node_id}: State synchronized - "
+                   f"coordinator={coordinator_id}, known_nodes={sorted(known_nodes)}")
     
     def _handle_trade_request(self, message):
         """
@@ -566,10 +649,10 @@ class Node:
             # Execute our side of the trade
             self.ledger.execute_pending_trade(trade_id, self.vector_clock.get_clock())
             
-            # Send confirmation
+            # Send confirmation (reliable to prevent lost credits)
             clock = self.vector_clock.increment()
             confirm = create_trade_confirm(self.node_id, clock, trade_id, success=True)
-            self.unicast.send(confirm, sender_id)
+            self.unicast.send_with_retry(confirm, sender_id, retries=5)  # Critical: trade must be confirmed
             
             # Update heartbeat with new balance
             self.heartbeat.set_energy_credits(self.ledger.get_balance())
@@ -881,9 +964,29 @@ def parse_args():
     )
     
     parser.add_argument(
+        "--host",
+        type=str,
+        default=None,
+        help="IP address to bind this node to (for multi-device deployment)"
+    )
+    
+    parser.add_argument(
+        "--peers",
+        type=str,
+        default="",
+        help="Node-to-IP mappings for multi-device (e.g., 1:192.168.1.10,2:192.168.1.11)"
+    )
+    
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable debug logging"
+    )
+    
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress most log output (only show errors and user messages)"
     )
     
     return parser.parse_args()
@@ -893,8 +996,10 @@ def main():
     """Main entry point."""
     args = parse_args()
     
-    # Set debug logging if requested
-    if args.debug:
+    # Set logging level based on flags
+    if args.quiet:
+        logging.getLogger().setLevel(logging.ERROR)
+    elif args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
     
     # Parse known nodes
@@ -902,8 +1007,27 @@ def main():
     if args.nodes:
         known_nodes = {int(nid.strip()) for nid in args.nodes.split(",") if nid.strip()}
     
+    # Parse peer addresses for multi-device deployment
+    # Format: 1:192.168.1.10,2:192.168.1.11,3:192.168.1.12
+    peer_addresses = {}
+    if args.peers:
+        for mapping in args.peers.split(","):
+            if ":" in mapping:
+                parts = mapping.strip().split(":")
+                if len(parts) == 2:
+                    node_id_str, ip = parts
+                    peer_addresses[int(node_id_str)] = ip
+    
+    # Auto-detect host IP if not provided
+    # This enables multi-device deployment without manual --host argument
+    from config import get_local_ip
+    host = args.host
+    if host is None:
+        host = get_local_ip()
+        logger.info(f"Auto-detected local IP: {host}")
+    
     # Create and start node
-    node = Node(args.node_id, known_nodes)
+    node = Node(args.node_id, known_nodes, host=host, peer_addresses=peer_addresses)
     
     try:
         node.start()
