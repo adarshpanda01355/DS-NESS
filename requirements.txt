@@ -1,0 +1,16 @@
+# Distributed Energy Trading System
+# ===================================
+# This project uses Python standard library only.
+# No external dependencies required.
+#
+# Python version: 3.8+
+#
+# Standard library modules used:
+# - socket (UDP networking)
+# - threading (concurrent operations)
+# - json (message serialization)
+# - logging (debug/info output)
+# - argparse (CLI argument parsing)
+# - dataclasses (transaction records)
+# - collections (deque, defaultdict)
+# - time, struct, copy, enum, typing, os
