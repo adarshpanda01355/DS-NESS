@@ -87,10 +87,10 @@ ELECTION_TIMEOUT = float(os.environ.get("DS_ELECTION_TIMEOUT", "5.0"))
 
 # Number of times to retry sending a message before giving up
 # Used for critical messages like trade confirmations
-MESSAGE_RETRY_COUNT = 3
+MESSAGE_RETRY_COUNT = int(os.environ.get("DS_MESSAGE_RETRY_COUNT", "5"))
 
 # Delay between message retries in seconds
-MESSAGE_RETRY_DELAY = 1.0
+MESSAGE_RETRY_DELAY = float(os.environ.get("DS_MESSAGE_RETRY_DELAY", "1.5"))
 
 # ==============================================================================
 # Buffer and Synchronization Configuration
@@ -99,6 +99,8 @@ MESSAGE_RETRY_DELAY = 1.0
 # Interval for flushing/synchronizing buffered state (e.g., ledger updates)
 # Coordinator broadcasts aggregated state at this interval
 BUFFER_FLUSH_INTERVAL = 5.0
+# Interval for anti-entropy gossip exchanges (seconds)
+GOSSIP_INTERVAL = float(os.environ.get("DS_GOSSIP_INTERVAL", "8.0"))
 
 # ==============================================================================
 # Energy Trading Configuration

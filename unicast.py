@@ -283,29 +283,42 @@ class UnicastHandler:
         
         # Create event for waiting on ACK
         ack_event = threading.Event()
-        
+
         with self._ack_lock:
             self._pending_acks[message_id] = ack_event
-        
+
         try:
             # Send the message
             if not self.send(message, target_node_id):
                 return False
-            
+
             # Wait for ACK
             received = ack_event.wait(timeout=timeout)
-            
+
             if received:
                 logger.debug(f"Node {self.node_id}: ACK received for message {message_id}")
             else:
                 logger.debug(f"Node {self.node_id}: ACK timeout for message {message_id}")
-            
+
             return received
-            
+
         finally:
-            # Clean up pending ACK
-            with self._ack_lock:
-                self._pending_acks.pop(message_id, None)
+            # Instead of immediately removing the pending ACK entry, keep it for a
+            # short grace period so that late ACKs arriving just after timeout
+            # can still be processed and logged. This avoids noisy "timeout"
+            # followed by a late ACK log. We spawn a daemon cleanup thread.
+            def _delayed_cleanup(mid, delay):
+                try:
+                    time.sleep(delay)
+                    with self._ack_lock:
+                        self._pending_acks.pop(mid, None)
+                except Exception:
+                    pass
+
+            # Use a small grace period proportional to timeout (min 0.5s, max 5s)
+            grace = max(0.5, min(5.0, float(timeout) if timeout else 1.0))
+            t = threading.Thread(target=_delayed_cleanup, args=(message_id, grace), daemon=True)
+            t.start()
     
     def acknowledge(self, message_id):
         """

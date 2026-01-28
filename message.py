@@ -52,6 +52,12 @@ MSG_TRADE_CONFIRM = "TRADE_CONFIRM"
 # Ledger synchronization messages
 # LEDGER_SYNC: coordinator broadcasts current ledger state
 MSG_LEDGER_SYNC = "LEDGER_SYNC"
+# State request (used by new coordinator to poll peers for their ledger state)
+MSG_STATE_REQUEST = "STATE_REQUEST"
+# Acknowledgement message for reliable unicast
+MSG_ACK = "ACK"
+# Anti-entropy gossip
+MSG_GOSSIP = "GOSSIP"
 
 
 # ==============================================================================
@@ -265,8 +271,10 @@ def create_coordinator(sender_id, sender_priority, vector_clock):
     Returns:
         Message: Coordinator announcement to broadcast to all nodes
     """
+    # Include a message id so receivers can deduplicate reliable multicast copies
+    payload = {"msg_id": f"coord-{sender_id}-{time.time()}"}
     return Message(MSG_COORDINATOR, sender_id, sender_priority=sender_priority,
-                   vector_clock=vector_clock)
+                   vector_clock=vector_clock, payload=payload)
 
 
 def create_trade_request(sender_id, vector_clock, target_id, amount, trade_type):
@@ -317,7 +325,7 @@ def create_trade_response(sender_id, vector_clock, trade_id, accepted, reason=No
                    payload=payload)
 
 
-def create_trade_confirm(sender_id, vector_clock, trade_id, success):
+def create_trade_confirm(sender_id, vector_clock, trade_id, success, buyer_id=None, seller_id=None, amount=None):
     """
     Create a trade confirmation message.
     
@@ -326,6 +334,9 @@ def create_trade_confirm(sender_id, vector_clock, trade_id, success):
         vector_clock: Current vector clock state
         trade_id: ID of the confirmed trade
         success: Boolean indicating if trade completed successfully
+        buyer_id: ID of the buying node (optional)
+        seller_id: ID of the selling node (optional)
+        amount: Amount of credits traded (optional)
         
     Returns:
         Message: Trade confirmation message
@@ -334,6 +345,12 @@ def create_trade_confirm(sender_id, vector_clock, trade_id, success):
         "trade_id": trade_id,
         "success": success
     }
+    if buyer_id is not None:
+        payload["buyer_id"] = buyer_id
+    if seller_id is not None:
+        payload["seller_id"] = seller_id
+    if amount is not None:
+        payload["amount"] = amount
     return Message(MSG_TRADE_CONFIRM, sender_id, vector_clock=vector_clock,
                    payload=payload)
 
@@ -349,7 +366,9 @@ def create_join(sender_id, vector_clock):
     Returns:
         Message: Join announcement to broadcast
     """
-    return Message(MSG_JOIN, sender_id, vector_clock=vector_clock)
+    # Include a message id so duplicates of the JOIN can be ignored
+    payload = {"msg_id": f"join-{sender_id}-{time.time()}"}
+    return Message(MSG_JOIN, sender_id, vector_clock=vector_clock, payload=payload)
 
 
 def create_join_response(sender_id, vector_clock, coordinator_id, known_nodes):
@@ -371,10 +390,28 @@ def create_join_response(sender_id, vector_clock, coordinator_id, known_nodes):
     payload = {
         "coordinator_id": coordinator_id,
         "known_nodes": list(known_nodes),
-        "clock_state": vector_clock  # New node will initialize from this
+        "clock_state": vector_clock,  # New node will initialize from this
+        # Optionally add ledger_state if provided (for join/rejoin sync)
     }
+    # Attach a message id so coordinator can detect ACKs
+    payload["msg_id"] = f"joinresp-{sender_id}-{time.time()}"
     return Message(MSG_JOIN_RESPONSE, sender_id, vector_clock=vector_clock,
                    payload=payload)
+
+
+def create_ledger_sync(sender_id, vector_clock, ledger_state):
+    """
+    Create a LEDGER_SYNC message with the current ledger state.
+    Args:
+        sender_id: ID of the coordinator sending the sync
+        vector_clock: Current vector clock state
+        ledger_state: Dict representing the ledger state
+    Returns:
+        Message: LEDGER_SYNC message
+    """
+    # Attach message id so recipients can ACK this specific sync
+    payload = {"ledger_state": ledger_state, "msg_id": f"ledger-{sender_id}-{time.time()}"}
+    return Message(MSG_LEDGER_SYNC, sender_id, vector_clock=vector_clock, payload=payload)
 
 
 def create_leave(sender_id, vector_clock):
@@ -389,3 +426,42 @@ def create_leave(sender_id, vector_clock):
         Message: Leave announcement to broadcast
     """
     return Message(MSG_LEAVE, sender_id, vector_clock=vector_clock)
+
+
+def create_state_request(sender_id, vector_clock):
+    """
+    Create a state request message asking a peer to send its ledger state.
+
+    Args:
+        sender_id: ID of the requester (typically new coordinator)
+        vector_clock: Current vector clock state
+
+    Returns:
+        Message: STATE_REQUEST message
+    """
+    payload = {"request": "ledger_state"}
+    return Message(MSG_STATE_REQUEST, sender_id, vector_clock=vector_clock, payload=payload)
+
+
+def create_ack(sender_id, vector_clock, msg_id):
+    """
+    Create an ACK message acknowledging receipt of a message with `msg_id`.
+
+    Args:
+        sender_id: ID of the acknowledging node
+        vector_clock: Current vector clock state
+        msg_id: The message id being acknowledged
+
+    Returns:
+        Message: ACK message
+    """
+    payload = {"msg_id": msg_id}
+    return Message(MSG_ACK, sender_id, vector_clock=vector_clock, payload=payload)
+
+
+def create_gossip(sender_id, vector_clock, ledger_state):
+    """
+    Create a GOSSIP message carrying this node's ledger state for anti-entropy.
+    """
+    payload = {"ledger_state": ledger_state}
+    return Message(MSG_GOSSIP, sender_id, vector_clock=vector_clock, payload=payload)

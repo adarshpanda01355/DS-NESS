@@ -279,6 +279,22 @@ class EnergyLedger:
         """
         with self._pending_lock:
             return self._pending_trades.get(trade_id)
+
+    def has_trade(self, trade_id):
+        """
+        Check if a trade ID is known (either pending or completed).
+
+        Args:
+            trade_id: Trade identifier
+
+        Returns:
+            bool: True if trade is pending or already completed
+        """
+        with self._pending_lock:
+            if trade_id in self._pending_trades:
+                return True
+        with self._tx_lock:
+            return trade_id in self._completed_trades
     
     def remove_pending_trade(self, trade_id):
         """
@@ -355,45 +371,62 @@ class EnergyLedger:
     def get_state(self):
         """
         Return current ledger state for synchronization.
-        
-        Used by coordinator to broadcast state to all nodes.
-        
-        Returns:
-            dict: Ledger state including balance and recent transactions
+        Includes balance, all transactions, and completed trades.
         """
         with self._balance_lock:
             balance = self._balance
-        
         with self._tx_lock:
-            # Include last few transaction IDs for sync verification
-            recent_tx_ids = [tx.trade_id for tx in self._transactions[-10:]]
-        
+            transactions = [
+                {
+                    "tx_type": tx.tx_type.value,
+                    "amount": tx.amount,
+                    "counterparty_id": tx.counterparty_id,
+                    "trade_id": tx.trade_id,
+                    "timestamp": tx.timestamp,
+                    "vector_clock": tx.vector_clock,
+                    "balance_after": tx.balance_after
+                }
+                for tx in self._transactions
+            ]
+            completed_trades = list(self._completed_trades)
         return {
             "node_id": self.node_id,
             "balance": balance,
-            "transaction_count": len(self._transactions),
-            "recent_trade_ids": recent_tx_ids
+            "transactions": transactions,
+            "completed_trades": completed_trades
         }
     
     def sync_from_state(self, state):
         """
         Synchronize ledger from coordinator's state.
-        
-        Note: This is a simplified sync that just updates balance.
-        A production system would need proper state reconciliation.
-        
-        Args:
-            state: State dictionary from coordinator
+        Updates balance, transaction history, and completed trades.
         """
         if state.get("node_id") != self.node_id:
             return
-        
         with self._balance_lock:
             old_balance = self._balance
             self._balance = state.get("balance", self._balance)
-        
-        logger.info(f"Node {self.node_id}: Synced ledger state "
-                   f"(balance: {old_balance} -> {self._balance})")
+        with self._tx_lock:
+            self._transactions.clear()
+            for tx in state.get("transactions", []):
+                from enum import Enum
+                class _FakeEnum(Enum):
+                    BUY = "BUY"
+                    SELL = "SELL"
+                tx_type = _FakeEnum(tx["tx_type"]) if isinstance(tx["tx_type"], str) else tx["tx_type"]
+                self._transactions.append(
+                    Transaction(
+                        tx_type=TransactionType.BUY if tx_type == _FakeEnum.BUY else TransactionType.SELL,
+                        amount=tx["amount"],
+                        counterparty_id=tx["counterparty_id"],
+                        trade_id=tx["trade_id"],
+                        timestamp=tx["timestamp"],
+                        vector_clock=tx.get("vector_clock"),
+                        balance_after=tx.get("balance_after", 0)
+                    )
+                )
+            self._completed_trades = set(state.get("completed_trades", []))
+        logger.info(f"Node {self.node_id}: Synced ledger state (balance: {old_balance} -> {self._balance}, tx count: {len(self._transactions)})")
     
     def print_status(self):
         """
@@ -417,5 +450,5 @@ class EnergyLedger:
             for tx in recent:
                 direction = "from" if tx.tx_type == TransactionType.BUY else "to"
                 print(f"    {tx.tx_type.value} {tx.amount} credits {direction} Node {tx.counterparty_id}")
-        
+    
         print(f"{'='*40}\n")

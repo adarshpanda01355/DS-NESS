@@ -32,6 +32,7 @@ Usage:
 """
 
 import sys
+import os
 import argparse
 import threading
 import time
@@ -47,10 +48,12 @@ from unicast import UnicastHandler
 from message import (
     Message, MSG_HEARTBEAT, MSG_ELECTION, MSG_OK, MSG_COORDINATOR,
     MSG_JOIN, MSG_JOIN_RESPONSE, MSG_LEAVE, MSG_TRADE_REQUEST, MSG_TRADE_RESPONSE,
-    MSG_TRADE_CONFIRM, MSG_LEDGER_SYNC,
+    MSG_TRADE_CONFIRM, MSG_LEDGER_SYNC, MSG_STATE_REQUEST, MSG_ACK, MSG_GOSSIP,
     create_join, create_join_response, create_leave, create_trade_request, create_trade_response,
-    create_trade_confirm
+    create_trade_confirm, create_ledger_sync, create_state_request, create_ack
 )
+import random
+from config import GOSSIP_INTERVAL
 from vector_clock import VectorClock
 from heartbeat import HeartbeatManager
 from election import ElectionManager
@@ -169,6 +172,18 @@ class Node:
         
         # Buffer check thread
         self._buffer_thread = None
+
+        # Global ledger registry: node_id -> ledger state
+        # Only used by coordinator, but always present for code simplicity
+        self._global_ledger_registry = {}
+        # Initialize with own state
+        self._global_ledger_registry[self.node_id] = self.ledger.get_state()
+
+        # Recent message deduplication (msg_id -> timestamp)
+        self._recent_msg_ids = {}
+        self._recent_lock = threading.Lock()
+        # Deduplication cleanup thread control
+        self._dedup_thread = None
         
         logger.info(f"Node {self.node_id}: Initialized with priority {self.priority}")
         logger.info(f"Node {self.node_id}: Known nodes: {self._known_nodes}")
@@ -239,21 +254,17 @@ class Node:
         """
         logger.info(f"Node {self.node_id}: ========== STARTING NODE ==========")
         self._running = True
-        
         # 1. Start message listeners
         self.multicast.start_receiving(self._on_multicast_message)
         self.unicast.start_receiving(self._on_unicast_message)
         logger.info(f"Node {self.node_id}: Message listeners started")
-        
         # 2. Start heartbeat manager
         self.heartbeat.set_energy_credits(self.ledger.get_balance())
         self.heartbeat.start()
-        
         # Add known nodes to heartbeat tracking
         for nid in self._known_nodes:
             if nid != self.node_id:
                 self.heartbeat.add_node(nid)
-        
         # 3. Start buffer check thread
         self._buffer_thread = threading.Thread(
             target=self._check_buffer_loop,
@@ -261,16 +272,50 @@ class Node:
             daemon=True
         )
         self._buffer_thread.start()
-        
+        # 3b. Start gossip thread for anti-entropy
+        self._gossip_thread = threading.Thread(
+            target=self._gossip_loop,
+            name=f"Gossip-{self.node_id}",
+            daemon=True
+        )
+        self._gossip_thread.start()
+        # Start dedup cleanup thread
+        self._dedup_thread = threading.Thread(
+            target=self._dedup_cleanup_loop,
+            name=f"Dedup-Cleanup-{self.node_id}",
+            daemon=True
+        )
+        self._dedup_thread.start()
         # 4. Announce join
         self._announce_join()
-        
         # 5. Dynamic discovery - wait a bit then check if election needed
         time.sleep(HEARTBEAT_INTERVAL)
         if self.election.get_coordinator() is None:
             logger.info(f"Node {self.node_id}: No coordinator known, starting election")
             self.election.start_election()
-        
+        # If not coordinator, request state sync from coordinator
+        coordinator_id = self.election.get_coordinator()
+        if coordinator_id is not None and coordinator_id != self.node_id:
+            from message import create_ledger_sync
+            clock = self.vector_clock.increment()
+            # Send a LEDGER_SYNC request to coordinator (could be a custom message, here we just send a request)
+            # For simplicity, coordinator will send LEDGER_SYNC on join anyway
+            logger.info(f"Node {self.node_id}: Requesting state sync from coordinator Node {coordinator_id}")
+            # No explicit request message, coordinator will send LEDGER_SYNC on join
+        # If coordinator, send LEDGER_SYNC to all nodes (except self)
+        if self.election.is_coordinator():
+            from message import create_ledger_sync
+            clock = self.vector_clock.increment()
+            # Send each node its own state from the registry
+            with self._nodes_lock:
+                for nid in self._known_nodes:
+                    if nid != self.node_id:
+                        state = self._global_ledger_registry.get(nid, self.ledger.get_state())
+                        ledger_sync_msg = create_ledger_sync(self.node_id, clock, state)
+                        sent = self.send_with_ack_retry(ledger_sync_msg, nid, attempts=5, timeout=1.5)
+                        if not sent:
+                            logger.warning(f"Node {self.node_id}: LEDGER_SYNC to Node {nid} not ACKed")
+            logger.info(f"Node {self.node_id}: Sent per-node LEDGER_SYNC to all nodes after join")
         # 6. Start command loop (blocking)
         logger.info(f"Node {self.node_id}: Node is ready")
         self._command_loop()
@@ -298,6 +343,13 @@ class Node:
         # 3. Stop message listeners
         self.multicast.stop_receiving()
         self.unicast.stop_receiving()
+        # Stop gossip thread
+        try:
+            if hasattr(self, '_gossip_thread') and self._gossip_thread.is_alive():
+                # thread checks self._running and will exit
+                self._gossip_thread.join(timeout=1.0)
+        except Exception:
+            pass
         
         # 4. Close sockets
         self.multicast.close()
@@ -320,6 +372,22 @@ class Node:
         Broadcast LEAVE message before shutting down.
         """
         clock = self.vector_clock.increment()
+        # Before leaving, send our latest ledger state to the coordinator
+        try:
+            coordinator_id = self.election.get_coordinator()
+            from message import create_ledger_sync, create_leave
+            ledger_state = self.ledger.get_state()
+            if coordinator_id is not None and coordinator_id != self.node_id:
+                state_msg = create_ledger_sync(self.node_id, clock, ledger_state)
+                # send reliably so coordinator registry is up-to-date and wait for ACK
+                sent = self.send_with_ack_retry(state_msg, coordinator_id, attempts=5, timeout=1.5)
+                if sent:
+                    logger.debug(f"Node {self.node_id}: Sent ledger state to coordinator {coordinator_id} before leave (ACK received)")
+                else:
+                    logger.warning(f"Node {self.node_id}: Sent ledger state to coordinator {coordinator_id} before leave (no ACK)")
+        except Exception as e:
+            logger.error(f"Node {self.node_id}: Error sending state to coordinator on leave: {e}")
+
         leave_msg = create_leave(self.node_id, clock)
         self.multicast.send(leave_msg)
         logger.info(f"Node {self.node_id}: LEAVE announced")
@@ -345,6 +413,15 @@ class Node:
             # Ignore our own messages (we receive them due to loopback)
             if message.sender_id == self.node_id:
                 return
+
+            # Deduplicate messages that include an explicit msg_id
+            try:
+                mid = message.payload.get('msg_id')
+                if mid and self._is_duplicate(mid):
+                    logger.debug(f"Node {self.node_id}: Ignoring duplicate multicast msg_id={mid}")
+                    return
+            except Exception:
+                pass
             
             # Dynamic peer discovery: learn sender's IP from multicast message
             # This enables unicast communication without pre-configuring --peers
@@ -360,7 +437,7 @@ class Node:
                 return
             
             # Check causal delivery for application messages
-            if message.message_type in [MSG_TRADE_REQUEST, MSG_TRADE_CONFIRM, MSG_LEDGER_SYNC]:
+            if message.message_type in [MSG_TRADE_REQUEST, MSG_TRADE_CONFIRM]:
                 if not self.vector_clock.can_deliver(message.sender_id, message.vector_clock):
                     logger.debug(f"Node {self.node_id}: Buffering message for causal delivery")
                     self._message_buffer.add(message, addr)
@@ -389,7 +466,20 @@ class Node:
         try:
             message = Message.from_bytes(data)
             
+            # Dynamic peer discovery: learn sender's IP from unicast message
+            sender_ip = addr[0]
+            self.unicast.register_peer(message.sender_id, sender_ip)
+            
             logger.debug(f"Node {self.node_id}: Unicast received: {message}")
+
+            # Deduplicate messages that include an explicit msg_id
+            try:
+                mid = message.payload.get('msg_id')
+                if mid and self._is_duplicate(mid):
+                    logger.debug(f"Node {self.node_id}: Ignoring duplicate unicast msg_id={mid}")
+                    return
+            except Exception:
+                pass
             
             # Update vector clock
             self.vector_clock.update(message.vector_clock)
@@ -441,6 +531,12 @@ class Node:
         # Ledger sync
         elif msg_type == MSG_LEDGER_SYNC:
             self._handle_ledger_sync(message)
+        elif msg_type == MSG_STATE_REQUEST:
+            self._handle_state_request(message)
+        elif msg_type == MSG_ACK:
+            self._handle_ack(message)
+        elif msg_type == MSG_GOSSIP:
+            self._handle_gossip(message)
         
         else:
             logger.warning(f"Node {self.node_id}: Unknown message type: {msg_type}")
@@ -507,23 +603,36 @@ class Node:
             # Get current state to send to new node
             clock = self.vector_clock.increment()
             current_clock_state = self.vector_clock.get_clock()
-            
+            # Get the rejoining node's state from the registry, or default to initial state
+            ledger_state = self._global_ledger_registry.get(new_node_id, {
+                'balance': INITIAL_ENERGY_CREDITS,
+                'transaction_history': [],
+                'pending_trades': {},
+                'node_id': new_node_id
+            })
             with self._nodes_lock:
                 known_nodes_list = list(self._known_nodes)
-            
             # Create and send JOIN_RESPONSE with state (reliable unicast)
+            from message import create_join_response, create_ledger_sync, create_coordinator
             join_response = create_join_response(
                 sender_id=self.node_id,
                 vector_clock=clock,
                 coordinator_id=self.node_id,
                 known_nodes=known_nodes_list
             )
-            # Add clock_state to payload (already included in create_join_response)
-            self.unicast.send_with_retry(join_response, new_node_id, retries=5)
-            logger.info(f"Node {self.node_id}: Sent JOIN_RESPONSE to Node {new_node_id} with state")
-            
+            # Add ledger_state to payload
+            join_response.payload["ledger_state"] = ledger_state
+            sent = self.send_with_ack_retry(join_response, new_node_id, attempts=5, timeout=1.5)
+            if sent:
+                logger.info(f"Node {self.node_id}: Sent JOIN_RESPONSE to Node {new_node_id} with state (ACK received)")
+            else:
+                logger.warning(f"Node {self.node_id}: Sent JOIN_RESPONSE to Node {new_node_id} (no ACK)")
+            # Also send LEDGER_SYNC for redundancy (reliable unicast) and wait for ACK
+            ledger_sync_msg = create_ledger_sync(self.node_id, clock, ledger_state)
+            sent2 = self.send_with_ack_retry(ledger_sync_msg, new_node_id, attempts=5, timeout=1.5)
+            if not sent2:
+                logger.warning(f"Node {self.node_id}: LEDGER_SYNC to Node {new_node_id} not ACKed")
             # Also announce ourselves as coordinator (reliable multicast)
-            from message import create_coordinator
             coord_msg = create_coordinator(self.node_id, self.priority, clock)
             self.multicast.send_reliable(coord_msg)  # Critical: use reliable send
     
@@ -565,18 +674,14 @@ class Node:
         coordinator_id = payload.get("coordinator_id")
         known_nodes = payload.get("known_nodes", [])
         clock_state = payload.get("clock_state", {})
-        
+        ledger_state = payload.get("ledger_state")
         logger.info(f"Node {self.node_id}: Received JOIN_RESPONSE from coordinator Node {coordinator_id}")
-        
         # Update our vector clock from coordinator's state
-        # This ensures we can properly participate in causal ordering
         if clock_state:
             self.vector_clock.update(clock_state)
             logger.info(f"Node {self.node_id}: Vector clock synchronized from coordinator")
-        
         # Update coordinator reference
         self.election.set_coordinator(coordinator_id)
-        
         # Add all known nodes to our tracking
         for node_id in known_nodes:
             if node_id != self.node_id:
@@ -585,7 +690,23 @@ class Node:
                 self.vector_clock.add_node(node_id)
                 self.heartbeat.add_node(node_id)
                 self.election.add_node(node_id)
-        
+        # Sync ledger state if provided
+        if ledger_state:
+            # Always apply the received state, regardless of node_id
+            self.ledger.sync_from_state(ledger_state)
+            # No local persistence in this configuration
+            logger.info(f"Node {self.node_id}: Ledger state synchronized from coordinator")
+            # ACK the join response / ledger sync to coordinator if msg_id present
+            try:
+                msg_id = payload.get("msg_id")
+                if msg_id and coordinator_id is not None:
+                    from message import create_ack
+                    ack_clock = self.vector_clock.increment()
+                    ack = create_ack(self.node_id, ack_clock, msg_id)
+                    self.unicast.send(ack, coordinator_id)
+                    logger.debug(f"Node {self.node_id}: Sent ACK for JOIN_RESPONSE msg_id={msg_id} to coordinator {coordinator_id}")
+            except Exception:
+                pass
         logger.info(f"Node {self.node_id}: State synchronized - "
                    f"coordinator={coordinator_id}, known_nodes={sorted(known_nodes)}")
     
@@ -603,6 +724,15 @@ class Node:
         
         logger.info(f"Node {self.node_id}: Trade request from Node {sender_id}: "
                    f"{trade_type} {amount} credits (trade_id={trade_id})")
+
+        # Deduplicate: ignore if we already know about this trade (pending or completed)
+        try:
+            if self.ledger.has_trade(trade_id):
+                logger.debug(f"Node {self.node_id}: Ignoring duplicate trade request {trade_id} from Node {sender_id}")
+                return
+        except Exception:
+            # In case ledger lacks the method for some reason, continue normally
+            pass
         
         # If sender wants to SELL, we are the BUYER
         # If sender wants to BUY, we are the SELLER
@@ -615,11 +745,13 @@ class Node:
             accepted = True
             # Add to pending trades
             self.ledger.add_pending_trade(trade_id, "buy", amount, sender_id)
+            self._update_ledger_registry()
         elif trade_type == "buy":
             # Sender wants to buy from us - we're selling
             if self.ledger.can_sell(amount):
                 accepted = True
                 self.ledger.add_pending_trade(trade_id, "sell", amount, sender_id)
+                self._update_ledger_registry()
             else:
                 reason = "Insufficient credits"
         
@@ -646,12 +778,28 @@ class Node:
         if accepted:
             logger.info(f"Node {self.node_id}: Energy trade {trade_id} ACCEPTED by Node {sender_id}")
             
+            # Get trade details for confirmation message
+            trade = self.ledger.get_pending_trade(trade_id)
+            if trade:
+                if trade['trade_type'] == 'sell':
+                    seller_id = self.node_id
+                    buyer_id = trade['counterparty_id']
+                else:  # buy
+                    buyer_id = self.node_id
+                    seller_id = trade['counterparty_id']
+                amount = trade['amount']
+            else:
+                buyer_id = seller_id = amount = None
+            
             # Execute our side of the trade
             self.ledger.execute_pending_trade(trade_id, self.vector_clock.get_clock())
+            self._update_ledger_registry()
+            
+            # No local persistence in this configuration
             
             # Send confirmation (reliable to prevent lost credits)
             clock = self.vector_clock.increment()
-            confirm = create_trade_confirm(self.node_id, clock, trade_id, success=True)
+            confirm = create_trade_confirm(self.node_id, clock, trade_id, success=True, buyer_id=buyer_id, seller_id=seller_id, amount=amount)
             self.unicast.send_with_retry(confirm, sender_id, retries=5)  # Critical: trade must be confirmed
             
             # Update heartbeat with new balance
@@ -659,6 +807,7 @@ class Node:
         else:
             logger.info(f"Node {self.node_id}: Energy trade {trade_id} REJECTED by Node {sender_id}: {reason}")
             self.ledger.remove_pending_trade(trade_id)
+            self._update_ledger_registry()
     
     def _handle_trade_confirm(self, message):
         """
@@ -674,28 +823,203 @@ class Node:
         if success:
             logger.info(f"Node {self.node_id}: Energy trade {trade_id} CONFIRMED by Node {sender_id}")
             
+            if self.election.is_coordinator():
+                # Broadcast the confirm to all nodes so they can execute
+                self.multicast.send(message)
+                
+                # Update the global ledger registry with new balances
+                buyer_id = payload.get("buyer_id")
+                seller_id = payload.get("seller_id")
+                amount = payload.get("amount")
+                if buyer_id and seller_id and amount is not None:
+                    if buyer_id in self._global_ledger_registry:
+                        self._global_ledger_registry[buyer_id]['balance'] += amount
+                    if seller_id in self._global_ledger_registry:
+                        self._global_ledger_registry[seller_id]['balance'] -= amount
+            
             # Execute our side of the trade
             self.ledger.execute_pending_trade(trade_id, self.vector_clock.get_clock())
+            self._update_ledger_registry()
+            
+            # No local persistence in this configuration
             
             # Update heartbeat with new balance
             self.heartbeat.set_energy_credits(self.ledger.get_balance())
+            
+            # If not coordinator, send updated state to coordinator for registry
+            if not self.election.is_coordinator():
+                coordinator_id = self.election.get_coordinator()
+                if coordinator_id is not None:
+                    clock = self.vector_clock.increment()
+                    state_msg = create_ledger_sync(self.node_id, clock, self.ledger.get_state())
+                    sent = self.send_with_ack_retry(state_msg, coordinator_id, attempts=5, timeout=1.5)
+                    if not sent:
+                        logger.warning(f"Node {self.node_id}: LEDGER_SYNC to coordinator {coordinator_id} not ACKed")
         else:
             logger.warning(f"Node {self.node_id}: Energy trade {trade_id} FAILED")
             self.ledger.remove_pending_trade(trade_id)
+            self._update_ledger_registry()
     
     def _handle_ledger_sync(self, message):
         """
-        Handle LEDGER_SYNC message from coordinator.
+        Handle LEDGER_SYNC message.
         
-        Sync our ledger state with coordinator's view.
+        If from coordinator, sync our state.
+        If from follower, update registry (if we're coordinator).
         """
-        # Only accept sync from coordinator
-        if message.sender_id != self.election.get_coordinator():
-            logger.debug(f"Node {self.node_id}: Ignoring LEDGER_SYNC from non-coordinator")
-            return
+        sender_id = message.sender_id
+        coordinator_id = self.election.get_coordinator()
         
-        # For now, just log the sync - full implementation would reconcile state
-        logger.debug(f"Node {self.node_id}: Received LEDGER_SYNC from coordinator")
+        if sender_id == coordinator_id:
+            # Sync from coordinator
+            ledger_state = message.payload.get("ledger_state")
+            if ledger_state:
+                # Always apply the received state, regardless of node_id
+                self.ledger.sync_from_state(ledger_state)
+                logger.info(f"Node {self.node_id}: Ledger state synchronized from coordinator (LEDGER_SYNC)")
+            else:
+                logger.debug(f"Node {self.node_id}: Received LEDGER_SYNC from coordinator (no state)")
+        elif self.election.is_coordinator():
+            # Update registry with follower's state
+            ledger_state = message.payload.get("ledger_state")
+            if ledger_state:
+                self._global_ledger_registry[sender_id] = ledger_state
+                logger.debug(f"Node {self.node_id}: Updated registry for Node {sender_id}")
+        else:
+            logger.debug(f"Node {self.node_id}: Ignoring LEDGER_SYNC from Node {sender_id}")
+
+        # If coordinator, update the registry with the latest state for this node
+        if self.election.is_coordinator() and sender_id == coordinator_id:
+            ledger_state = message.payload.get("ledger_state")
+            if ledger_state:
+                node_id = ledger_state.get("node_id")
+                if node_id is not None:
+                    self._global_ledger_registry[node_id] = ledger_state
+        # Send ACK for LEDGER_SYNC messages that include a msg_id
+        msg_id = message.payload.get("msg_id")
+        if msg_id:
+            try:
+                from message import create_ack
+                ack_clock = self.vector_clock.increment()
+                ack = create_ack(self.node_id, ack_clock, msg_id)
+                # use simple send for ACK (no need to wait)
+                self.unicast.send(ack, sender_id)
+                logger.debug(f"Node {self.node_id}: Sent ACK for msg_id={msg_id} to Node {sender_id}")
+            except Exception as e:
+                logger.error(f"Node {self.node_id}: Failed to send ACK for LEDGER_SYNC: {e}")
+
+    def _handle_state_request(self, message):
+        """
+        Handle STATE_REQUEST message from a coordinator who wants our ledger state.
+
+        Respond with a LEDGER_SYNC (our current ledger state) via reliable unicast.
+        """
+        requester_id = message.sender_id
+        logger.info(f"Node {self.node_id}: Received STATE_REQUEST from Node {requester_id}")
+        try:
+            clock = self.vector_clock.increment()
+            ledger_state = self.ledger.get_state()
+            state_msg = create_ledger_sync(self.node_id, clock, ledger_state)
+            # send reliably back to requester (new coordinator) and wait for ACK
+            sent = self.send_with_ack_retry(state_msg, requester_id, attempts=5, timeout=1.5)
+            if sent:
+                logger.debug(f"Node {self.node_id}: Sent LEDGER_SYNC to Node {requester_id} in response to STATE_REQUEST and received ACK")
+            else:
+                logger.warning(f"Node {self.node_id}: Sent LEDGER_SYNC to Node {requester_id} but did not receive ACK")
+        except Exception as e:
+            logger.error(f"Node {self.node_id}: Failed to respond to STATE_REQUEST from {requester_id}: {e}")
+
+    def _handle_gossip(self, message):
+        """
+        Handle incoming GOSSIP message: update local view of sender's ledger state.
+        This provides anti-entropy to help rebuild registry after crashes/partitions.
+        """
+        sender_id = message.sender_id
+        ledger_state = message.payload.get("ledger_state")
+        if ledger_state:
+            # Update local registry copy (used by coordinator and helpful for followers)
+            try:
+                self._global_ledger_registry[sender_id] = ledger_state
+                logger.debug(f"Node {self.node_id}: GOSSIP updated registry entry for Node {sender_id}")
+            except Exception as e:
+                logger.error(f"Node {self.node_id}: Error applying gossip from {sender_id}: {e}")
+
+    def _handle_ack(self, message):
+        """
+        Handle ACK message by unblocking any waiting sender.
+        """
+        payload = message.payload
+        msg_id = payload.get("msg_id")
+        if not msg_id:
+            logger.debug(f"Node {self.node_id}: Received ACK with no msg_id from Node {message.sender_id}")
+            return
+        # Notify Unicast handler that an ACK arrived
+        try:
+            self.unicast.acknowledge(msg_id)
+            logger.debug(f"Node {self.node_id}: Processed ACK for msg_id={msg_id} from Node {message.sender_id}")
+        except Exception as e:
+            logger.error(f"Node {self.node_id}: Error processing ACK for {msg_id}: {e}")
+
+    def _is_duplicate(self, msg_id, window_seconds=30):
+        """
+        Check and record a message id for deduplication.
+        Returns True if the msg_id was seen recently.
+        """
+        now = time.time()
+        with self._recent_lock:
+            if msg_id in self._recent_msg_ids:
+                return True
+            self._recent_msg_ids[msg_id] = now
+        return False
+
+    def _dedup_cleanup_loop(self, purge_interval=5, ttl=30):
+        """Background thread: purge old msg_ids periodically."""
+        while self._running:
+            try:
+                cutoff = time.time() - ttl
+                with self._recent_lock:
+                    to_remove = [mid for mid, ts in self._recent_msg_ids.items() if ts < cutoff]
+                    for mid in to_remove:
+                        self._recent_msg_ids.pop(mid, None)
+                time.sleep(purge_interval)
+            except Exception:
+                time.sleep(purge_interval)
+
+    def send_with_ack_retry(self, message, target_node_id, attempts=3, timeout=1.5):
+        """
+        Send a message and wait for an ACK, retrying up to `attempts` times.
+
+        Uses `message.payload['msg_id']` as the message identifier.
+        """
+        msg_id = None
+        if isinstance(message, Message):
+            msg_id = message.payload.get('msg_id')
+        if not msg_id:
+            # Fallback: generate a temporary msg_id
+            msg_id = f"msg-{self.node_id}-{target_node_id}-{time.time()}"
+            if isinstance(message, Message):
+                message.payload['msg_id'] = msg_id
+
+        for attempt in range(attempts):
+            try:
+                ok = self.unicast.send_and_wait_ack(message, target_node_id, timeout=timeout, message_id=msg_id)
+                if ok:
+                    return True
+            except Exception as e:
+                logger.error(f"Node {self.node_id}: send_with_ack_retry error to Node {target_node_id}: {e}")
+            # small backoff
+            time.sleep(0.2)
+
+        return False
+
+    def _update_ledger_registry(self):
+        """
+        Update the global ledger registry with this node's current state.
+        Should be called after any trade or ledger change.
+        Only does work if this node is the coordinator.
+        """
+        if hasattr(self, 'election') and self.election.is_coordinator():
+            self._global_ledger_registry[self.node_id] = self.ledger.get_state()
     
     # ==========================================================================
     # Callbacks
@@ -712,6 +1036,64 @@ class Node:
             logger.info(f"Node {self.node_id}: I am now the COORDINATOR")
         else:
             logger.info(f"Node {self.node_id}: New coordinator is Node {new_coordinator_id}")
+        # When coordinator changes, proactively send our current ledger state
+        # to the new coordinator so it can rebuild its registry reliably.
+        try:
+            if new_coordinator_id is not None and new_coordinator_id != self.node_id:
+                from message import create_ledger_sync
+                clock = self.vector_clock.increment()
+                ledger_state = self.ledger.get_state()
+                msg = create_ledger_sync(self.node_id, clock, ledger_state)
+                # send reliably to new coordinator so registry gets updated and wait for ACK
+                sent = self.send_with_ack_retry(msg, new_coordinator_id, attempts=5, timeout=1.5)
+                if sent:
+                    logger.debug(f"Node {self.node_id}: Sent ledger state to new coordinator Node {new_coordinator_id} (ACK received)")
+                else:
+                    logger.warning(f"Node {self.node_id}: Sent ledger state to new coordinator Node {new_coordinator_id} (no ACK)")
+        except Exception as e:
+            logger.error(f"Node {self.node_id}: Failed to send state to new coordinator: {e}")
+
+        # If *we* became the coordinator, actively poll peers for their ledger state
+        if new_coordinator_id == self.node_id:
+            try:
+                self._bootstrap_registry()
+            except Exception as e:
+                logger.error(f"Node {self.node_id}: Error during registry bootstrap: {e}")
+
+    def _bootstrap_registry(self, timeout_per_request=0.5):
+        """
+        When this node becomes coordinator, poll all known peers for their ledger state
+        so we can rebuild `_global_ledger_registry`.
+
+        Sends a `STATE_REQUEST` to each known node (except self). Followers reply
+        with a `LEDGER_SYNC` which is handled by `_handle_ledger_sync` to populate
+        the registry.
+        """
+        logger.info(f"Node {self.node_id}: Bootstrapping ledger registry from peers")
+        # Reset registry and add our own state
+        self._global_ledger_registry = {}
+        self._global_ledger_registry[self.node_id] = self.ledger.get_state()
+
+        with self._nodes_lock:
+            peers = [nid for nid in self._known_nodes if nid != self.node_id]
+
+        # Send state requests to peers
+        for nid in peers:
+            try:
+                clock = self.vector_clock.increment()
+                req = create_state_request(self.node_id, clock)
+                # best-effort reliable send; peers will respond with LEDGER_SYNC
+                sent = self.unicast.send_with_retry(req, nid, retries=3)
+                if not sent:
+                    logger.warning(f"Node {self.node_id}: STATE_REQUEST to Node {nid} failed")
+                else:
+                    logger.debug(f"Node {self.node_id}: STATE_REQUEST sent to Node {nid}")
+                # small pause to avoid flooding
+                time.sleep(timeout_per_request)
+            except Exception as e:
+                logger.error(f"Node {self.node_id}: Error requesting state from Node {nid}: {e}")
+
+        logger.info(f"Node {self.node_id}: Registry bootstrap requests sent to peers")
     
     def _on_node_failure(self, failed_node_id):
         """
@@ -762,6 +1144,31 @@ class Node:
                 logger.error(f"Node {self.node_id}: Error checking buffer: {e}")
             
             time.sleep(0.5)
+
+    def _gossip_loop(self):
+        """
+        Periodically gossip this node's ledger state to a random peer.
+        """
+        while self._running:
+            try:
+                # Choose a random peer to gossip to
+                with self._nodes_lock:
+                    peers = [nid for nid in self._known_nodes if nid != self.node_id]
+
+                if peers:
+                    target = random.choice(peers)
+                    clock = self.vector_clock.increment()
+                    from message import create_gossip
+                    state = self.ledger.get_state()
+                    gossip_msg = create_gossip(self.node_id, clock, state)
+                    # best-effort send (no ACK required)
+                    self.unicast.send(gossip_msg, target)
+                    logger.debug(f"Node {self.node_id}: GOSSIP sent to Node {target}")
+
+                time.sleep(GOSSIP_INTERVAL)
+            except Exception as e:
+                logger.error(f"Node {self.node_id}: Error in gossip loop: {e}")
+                time.sleep(GOSSIP_INTERVAL)
     
     # ==========================================================================
     # User Commands
@@ -833,22 +1240,22 @@ class Node:
         while self._running:
             try:
                 cmd = input(f"Node {self.node_id}> ").strip().lower()
-                
+
                 if not cmd:
                     continue
-                
+
                 parts = cmd.split()
                 command = parts[0]
-                
+
                 if command == "help":
                     self._print_help()
-                
+
                 elif command == "status":
                     self._print_status()
-                
+
                 elif command == "balance":
                     print(f"Balance: {self.ledger.get_balance()} credits")
-                
+
                 elif command == "sell":
                     if len(parts) != 3:
                         print("Usage: sell <node_id> <amount>")
@@ -856,7 +1263,7 @@ class Node:
                         target = int(parts[1])
                         amount = int(parts[2])
                         self.propose_trade(target, amount, "sell")
-                
+
                 elif command == "buy":
                     if len(parts) != 3:
                         print("Usage: buy <node_id> <amount>")
@@ -864,22 +1271,22 @@ class Node:
                         target = int(parts[1])
                         amount = int(parts[2])
                         self.propose_trade(target, amount, "buy")
-                
+
                 elif command == "nodes":
                     self._print_nodes()
-                
+
                 elif command == "history":
                     self.ledger.print_status()
-                
+
                 elif command == "election":
                     print("Starting election...")
                     self.election.start_election()
-                
+
                 elif command in ["quit", "exit", "q"]:
                     print("Shutting down...")
                     self._running = False
                     break
-                
+
                 else:
                     print(f"Unknown command: {command}. Type 'help' for commands.")
                     
@@ -1008,7 +1415,45 @@ def main():
     
     # Set logging level based on flags
     if args.quiet:
-        logging.getLogger().setLevel(logging.ERROR)
+        # Suppress console output but capture detailed logs to per-node files.
+        # Keep root logger level at DEBUG so file handlers can capture debug logs,
+        # but raise existing console/stream handlers to ERROR to silence terminal output.
+        root = logging.getLogger()
+        root.setLevel(logging.DEBUG)
+        for h in list(root.handlers):
+            try:
+                # Raise console/stream handlers to ERROR to quiet the terminal
+                h.setLevel(logging.ERROR)
+            except Exception:
+                pass
+        # Ensure logs directory exists
+        log_dir = os.path.join(os.getcwd(), 'logs')
+        try:
+            os.makedirs(log_dir, exist_ok=True)
+        except Exception:
+            pass
+        # Per-node log file path
+        logfile = os.path.join(log_dir, f'node-{args.node_id}.log')
+        # If the node previously had a log file, append a rejoin header
+        try:
+            rejoined = os.path.exists(logfile) and os.path.getsize(logfile) > 0
+            with open(logfile, 'a', encoding='utf-8') as f:
+                ts = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
+                if rejoined:
+                    f.write(f"\n=== Node {args.node_id} REJOINED at {ts} ===\n")
+                else:
+                    f.write(f"\n=== Node {args.node_id} STARTED at {ts} ===\n")
+        except Exception:
+            pass
+        # Add a file handler that logs DEBUG+ to the per-node file
+        try:
+            fh = logging.FileHandler(logfile, mode='a', encoding='utf-8')
+            fh.setLevel(logging.DEBUG)
+            fmt = logging.Formatter('%(asctime)s [%(levelname)-5s] %(name)-10s: %(message)s', datefmt='%H:%M:%S')
+            fh.setFormatter(fmt)
+            root.addHandler(fh)
+        except Exception:
+            pass
     elif args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
     
